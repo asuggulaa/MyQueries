@@ -1,0 +1,58 @@
+--Initial Review Times
+SELECT date_trunc('month', completed_at)    as month,
+       count(*)                             as count,
+       avg(EXTRACT(EPOCH FROM uwts) / 3600) as avg_time_spent
+FROM (
+         SELECT times.loan_file_id,
+                min(ir_times.locked_at)    locked_at,
+                min(ir_times.completed_at) completed_at,
+                sum(elapsed) AS            uwts
+         FROM (
+                  SELECT CASE
+                             WHEN (next_action_created_at - action_created_at > '1 hour')
+                                 THEN INTERVAL '0 hour'
+                             ELSE next_action_created_at - action_created_at
+                             END AS elapsed,
+                         *
+
+                  FROM event_stream
+                  WHERE account_id IN
+                        (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034,
+                         287375, 326494, 363719, 378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105,
+                         399526, 399871, 404841, 405179, 412917, 412922, 427399, 427400, 427401, 427402, 427404, 427406,
+                         427410, 429852, 429856, 454058, 464495, 465064, 465452, 471264, 497776, 497781, 497782, 582765,
+                         594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486, 877542, 880878, 921748,
+                         921749, 921752, 922235)
+              ) times
+
+                  INNER JOIN
+              (SELECT DISTINCT ca.loan_file_id,
+                               rlf.lock_issue locked_at,
+                               rlf.loan_purpose,
+                               rlf.created_at loan_file_at,
+                               ca.ca_at       completed_at
+               FROM (SELECT loan_file_id,
+                            max(created_at) ca_at
+                     FROM prod.loan_file_milestone_transition
+                     WHERE to_milestone = 'CONDITIONAL_APPROVAL'
+                     GROUP BY loan_file_id
+                    ) ca
+                        INNER JOIN reporting_loanfile rlf ON ca.loan_file_id = rlf.id
+              ) ir_times ON times.loan_file_id = ir_times.loan_file_id
+                  AND (times.action_created_at <= ir_times.completed_at)
+                  AND times.action_created_at >= ir_times.locked_at
+         group by 1
+     ) total_times
+
+         inner join reporting_loanfile on total_times.loan_file_id = reporting_loanfile.id and tenant = 'Better'
+         inner join staff_member on reporting_loanfile.underwriter_email = staff_member.internal_email
+
+WHERE completed_at >= '2019-07-01'
+  and staff_member.account_id IN
+      (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034, 287375, 326494, 363719,
+       378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105, 399526, 399871, 404841, 405179, 412917,
+       412922, 427399, 427400, 427401, 427402, 427404, 427406, 427410, 429852, 429856, 454058, 464495, 465064, 465452,
+       471264, 497776, 497781, 497782, 582765, 594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486,
+       877542, 880878, 921748, 921749, 921752, 922235)
+group by 1
+order by 1 desc;
