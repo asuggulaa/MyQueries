@@ -1,0 +1,78 @@
+SELECT
+  date_trunc('month', completed_at)     as month,
+  case when loan_purpose = 'Purchase' then 'Purchase' else 'Refinance' end as loan_purpose,
+  count(*)                             as count,
+  avg(EXTRACT(EPOCH FROM uwts) / 3600) as avg_time_spent
+FROM (
+       SELECT
+         times.loan_file_id,
+         min(fr_times.clear_to_close_at)    started_at,
+         min(fr_times.ready_for_fr) completed_at,
+         sum(elapsed) AS            uwts
+       FROM (
+              SELECT
+                CASE
+                WHEN (next_action_created_at - action_created_at > '1 hour')
+                  THEN INTERVAL '0 hour'
+                ELSE next_action_created_at - action_created_at
+                END AS elapsed,
+                *
+              FROM event_stream
+              WHERE account_id IN
+                    (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034, 287375, 326494, 363719, 378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105, 399526, 399871, 404841, 405179, 412917, 412922, 427399, 427400, 427401, 427402, 427404, 427406, 427410, 429852, 429856, 454058, 464495, 465064, 465452, 471264, 497776, 497781, 497782, 582765, 594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486, 877542, 880878, 921748, 921749, 921752, 922235)
+            ) times
+         INNER JOIN
+         (select lfke.loan_file_id,
+             sm.reports_to                                                                       as staff_member_id,
+             lfke.clear_to_close_at,
+             exp_cd.created_at                                                                   as expedited_cd_request_at,
+             coalesce(exp_cd.created_at, max(last_activity.completion_time))                     as ready_for_fr,
+             max(last_activity.completion_time)                                                  as last_activity_bef_fr,
+             clear_to_close_at - coalesce(exp_cd.created_at, max(last_activity.completion_time)) as response_time
+      from (select loan_file_id, clear_to_close_at
+            from derived.loan_file_key_events
+           ) lfke
+             --getting uw name and uw manager name
+             left join loan_file on loan_file.id = lfke.loan_file_id
+             LEFT JOIN staff_member sm on sm.id = loan_file.underwriter_id
+        --expedited cd tag details
+             left join tag_map exp_cd on exp_cd.loan_file_id = lfke.loan_file_id and exp_cd.tag_id = 250
+        --latest FR activity details
+             left join (select loan_file_id, max(created_at) as created_at
+                        from activity
+                        where name = 'CompleteFinalUnderwritingReview'
+                          and is_deleted = 'False'
+                        group by 1) fr_activity on fr_activity.loan_file_id = lfke.loan_file_id
+        -- time of completion of last activity before FR
+             LEFT JOIN
+           (select loan_file_id, ast.created_at as completion_time
+            from activity
+                   left join activity_status_transition ast on ast.activity_id = activity.id
+            where ((business_role not in
+                    ('UNDERWRITER', 'PREPROCESSOR', 'CLOSER', 'LOAN_OFFICER', 'CES') --excluded loan officer and closer because of certain activities which shouldn't block CTC
+              and requires_uw_review is false and to_status = 'Finished')
+              or (business_role not in
+                  ('UNDERWRITER', 'PREPROCESSOR', 'CLOSER', 'LOAN_OFFICER', 'CES') --excluded loan officer and closer because of certain activities which shouldn't block CTC
+                and requires_uw_review is true and to_status = 'UnderwriterReview')
+              or (business_role in ('UNDERWRITER', 'PREPROCESSOR') and to_status = 'Inbound'))
+              and is_deleted = 'False'
+              and activity.milestone in ('LOCK', 'PRELOCK','COMPLETE_DOCUMENTATION'
+'INITIAL_UNDERWRITING', 'INITIAL_DOCUMENTATION', 'VERIFIED_LETTER',
+'CONDITIONAL_APPROVAL'
+)
+              and activity.title NOT LIKE '%Notes to LR/UW%'
+              and activity.name NOT IN ('MortgageeChangeAlert')
+           ) last_activity
+           ON last_activity.loan_file_id = lfke.loan_file_id and last_activity.completion_time < fr_activity.created_at
+      group by 1, 2, 3, 4
+         ) fr_times ON times.loan_file_id = fr_times.loan_file_id
+                           AND (times.action_created_at <= clear_to_close_at)
+                       AND times.action_created_at >= ready_for_fr
+       group by 1
+     ) total_times
+  inner join reporting_loanfile on total_times.loan_file_id = reporting_loanfile.id and tenant = 'Better'
+  inner join staff_member on reporting_loanfile.underwriter_email = staff_member.internal_email
+WHERE completed_at >= '2019-10-01' and staff_member.account_id IN
+      (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034, 287375, 326494, 363719, 378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105, 399526, 399871, 404841, 405179, 412917, 412922, 427399, 427400, 427401, 427402, 427404, 427406, 427410, 429852, 429856, 454058, 464495, 465064, 465452, 471264, 497776, 497781, 497782, 582765, 594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486, 877542, 880878, 921748, 921749, 921752, 922235)
+group by 1, 2
+order by 1 desc
