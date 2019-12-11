@@ -1,0 +1,60 @@
+--Suspense Review Times
+SELECT
+  date_trunc('month', completed_at)     as month,
+  case when loan_purpose = 'Purchase' then 'Purchase' else 'Refinance' end as loan_purpose,
+  count(*)                             as count,
+  avg(EXTRACT(EPOCH FROM uwts) / 3600) as avg_time_spent
+FROM (
+       SELECT
+         times.loan_file_id,
+         min(sr_times.suspense_review_by_uw)    started_at,
+         min(sr_times.suspense_cleared_by_lr) completed_at,
+         sum(elapsed) AS            uwts
+       FROM (
+              SELECT
+                CASE
+                WHEN (next_action_created_at - action_created_at > '1 hour')
+                  THEN INTERVAL '0 hour'
+                ELSE next_action_created_at - action_created_at
+                END AS elapsed,
+                *
+              FROM event_stream
+              WHERE account_id IN
+                    (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034, 287375, 326494, 363719, 378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105, 399526, 399871, 404841, 405179, 412917, 412922, 427399, 427400, 427401, 427402, 427404, 427406, 427410, 429852, 429856, 454058, 464495, 465064, 465452, 471264, 497776, 497781, 497782, 582765, 594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486, 877542, 880878, 921748, 921749, 921752, 922235)
+            ) times
+         INNER JOIN
+         (      SELECT suspense.loan_file_id,
+             suspense.completed_at         as suspense_cleared_by_lr,
+             sm.reports_to                 as staff_member_id,
+             min(ir_activity.completed_at) as suspense_review_by_uw
+      FROM
+        --getting suspense activity details
+        (SELECT activity.loan_file_id, activity.id as activity_id, ast.created_at as completed_at
+         FROM activity
+                LEFT JOIN activity_status_transition ast on activity.id = ast.activity_id
+         where name LIKE 'ResolveInitialReviewSuspensionReasons%'
+           and ast.to_status = 'Finished'
+        ) suspense
+          --getting uw name and uw manager name
+          LEFT JOIN loan_file on loan_file.id = suspense.loan_file_id
+          LEFT JOIN staff_member sm on sm.id = loan_file.underwriter_id
+          --getting IR activity details
+          LEFT JOIN
+        (SELECT activity.loan_file_id, activity.id as activity_id, ast.created_at as completed_at
+         FROM activity
+                LEFT JOIN activity_status_transition ast on activity.id = ast.activity_id
+         where name = 'CompleteInitialUnderwriterReviewV2'
+           and ast.to_status = 'Finished'
+        ) ir_activity
+        on ir_activity.loan_file_id = suspense.loan_file_id and ir_activity.completed_at > suspense.completed_at
+      GROUP BY 1, 2, 3) sr_times ON times.loan_file_id = sr_times.loan_file_id
+                           AND (times.action_created_at <= suspense_review_by_uw)
+                       AND times.action_created_at >= suspense_cleared_by_lr
+       group by 1
+     ) total_times
+  inner join reporting_loanfile on total_times.loan_file_id = reporting_loanfile.id and tenant = 'Better'
+  inner join staff_member on reporting_loanfile.underwriter_email = staff_member.internal_email
+WHERE completed_at >= '2019-10-01' and staff_member.account_id IN
+      (151, 2015, 2379, 8234, 54925, 58950, 59209, 99665, 99666, 156717, 186937, 196668, 277034, 287375, 326494, 363719, 378995, 387036, 387069, 388186, 389679, 390490, 399100, 399102, 399105, 399526, 399871, 404841, 405179, 412917, 412922, 427399, 427400, 427401, 427402, 427404, 427406, 427410, 429852, 429856, 454058, 464495, 465064, 465452, 471264, 497776, 497781, 497782, 582765, 594566, 594596, 645959, 657339, 850579, 850580, 851016, 851017, 866486, 877542, 880878, 921748, 921749, 921752, 922235)
+group by 1, 2
+order by 1 desc
