@@ -1,0 +1,13 @@
+SELECT COUNT(*) FROM
+    (Select loan_file_key_events.loan_file_id,
+           max( case when path = '/Loan/VerifiedDTI' then value::text::numeric end) dti,
+           max( case when path = '/Loan/SelectedLoanProduct/LoanType' then value::text end) loan_type,
+           max( case when path = '/Loan/SelectedLoanProduct/PropertyType' then value::text end) property_type,
+           max( case when path = '/SubjectProperty/HasSubordinateLiensOnTitle' then value::text end) sub_liens,
+           max( case when path = '/BorrowerPairs/0/Borrower/Declarations/IntendToOccupyAsPrimaryResidence' then value::text end) primary_residence
+    FROM loan_file_key_events
+    LEFT JOIN current_loan_file_fact clff on loan_file_key_events.loan_file_id = clff.loan_file_id
+    WHERE loan_file_key_events.created_at > '2019-07-01' AND conditional_approval_started_at IS NOT NULL
+            and path in ('/Loan/VerifiedDTI','/Loan/SelectedLoanProduct/LoanType' , '/SubjectProperty/PropertyType' ,'/SubjectProperty/HasSubordinateLiensOnTitle' ,'/BorrowerPairs/0/Borrower/Declarations/IntendToOccupyAsPrimaryResidence')
+    group by 1) as fun
+WHERE dti < 0.5 AND loan_type != 'NonConforming' AND sub_liens = 'false' AND primary_residence = 'true';
