@@ -1,0 +1,234 @@
+with month as (SELECT month
+                   FROM
+                     (
+                       SELECT DISTINCT DATE_TRUNC('month', (getdate() :: date - id) :: date) :: date AS month
+                       FROM prod.account
+                     ) base
+                   WHERE month >= '2017-01-01'
+                   ORDER BY 1 desc),
+    start_stats as (SELECT
+                      DATE_TRUNC('month', lfke.locked_at) :: date as month,
+--                       sm.reports_to                               as staff_member_id,
+                      sum(CASE WHEN initial_review_completed_at is not null
+                        then 1
+                          else 0 end)                                initial_reviews_completed,
+                      sum(CASE WHEN complete_final_uw.loan_file_id is not null
+                        then 1
+                          else 0 end)                             as final_underwrites_completed
+                    FROM derived.loan_file_key_events lfke
+                      LEFT JOIN prod.loan_file lf on lfke.loan_file_id = lf.id
+                      LEFT JOIN staff_member sm on sm.id = lf.underwriter_id
+                      LEFT JOIN staff_member sm1 on sm.reports_to = sm1.id
+                      LEFT JOIN
+                      (
+                        select distinct activity.loan_file_id
+                        FROM activity
+                          LEFT JOIN activity_status_transition ast ON ast.activity_id = activity.id
+                        WHERE is_deleted IS FALSE
+                              and name = 'CompleteFinalUnderwritingReview'
+                              and to_status = 'Finished'
+                      ) complete_final_uw on lfke.loan_file_id = complete_final_uw.loan_file_id
+                    WHERE lfke.locked_at >= (getdate() - interval '14 months')
+                          and lf.underwriter_id is not null
+                          and sm.reports_to is not null
+                    GROUP BY 1
+                    ORDER BY 1 desc),
+    ir_cycle_time as (SELECT
+                        date_trunc('month', lfke.initial_review_completed_at) :: date as month,
+--                         sm.reports_to                                                 as staff_member_id,
+                        median(extract(epoch from lfke.initial_review_completed_at - last_activity_completed_at) /
+                               (60 * 60))                                             as initial_review_cycle_time
+                      FROM derived.loan_file_key_events lfke
+                        LEFT JOIN prod.loan_file lf on lfke.loan_file_id = lf.id
+                        LEFT JOIN staff_member sm on sm.id = lf.underwriter_id
+                        LEFT JOIN
+                        (SELECT
+                           ir_activity.loan_file_id,
+                           max(activity_completed_at) AS last_activity_completed_at
+                         FROM (select
+                                 loan_file_id,
+                                 initial_review_started_at
+                               from derived.loan_file_key_events) ir_activity
+                           LEFT JOIN
+                           (SELECT
+                              loan_file_id,
+                              activity_id,
+                              ast.created_at AS activity_completed_at
+                            FROM activity
+                              LEFT JOIN activity_status_transition ast ON activity.id = ast.activity_id
+                            WHERE ast.to_status = 'Inbound'
+                                  AND activity.milestone in ('LOCK',
+                                                             'PRELOCK',
+                                                             'INITIAL_DOCUMENTATION',
+                                                             'VERIFIED_LETTER')) borr_activities
+                             ON borr_activities.loan_file_id = ir_activity.loan_file_id AND
+                                ir_activity.initial_review_started_at > borr_activities.activity_completed_at
+                         GROUP BY 1
+                        ) last_activity_before_ir ON last_activity_before_ir.loan_file_id = lfke.loan_file_id
+                      WHERE DATE_TRUNC('month', lfke.initial_review_completed_at) >=
+                            date_trunc('month', getdate() - interval '14 months')
+                            and sm.reports_to is not null
+                      GROUP BY 1
+                      ORDER BY 1),
+    final_review_cycle_time as (select
+                                  date_trunc('month', clear_to_close_at) :: date as month,
+--                                   staff_member_id,
+                                  median(extract('minutes' from clear_to_close_at -
+                                                                ready_for_fr))   as final_review_cycle_time
+                                from (
+                                       select
+                                         lfke.loan_file_id,
+                                         sm.reports_to                       as staff_member_id,
+                                         lfke.clear_to_close_at,
+                                         exp_cd.created_at                   as expedited_cd_request_at,
+                                         coalesce(exp_cd.created_at, max(
+                                             last_activity.completion_time)) as ready_for_fr,
+                                         max(
+                                             last_activity.completion_time)  as last_activity_bef_fr,
+                                         clear_to_close_at - coalesce(exp_cd.created_at, max(
+                                             last_activity.completion_time)) as response_time
+                                       from (select
+                                               loan_file_id,
+                                               clear_to_close_at
+                                             from derived.loan_file_key_events
+                                            ) lfke
+                                         --getting uw name and uw manager name
+                                         left join loan_file on loan_file.id = lfke.loan_file_id
+                                         LEFT JOIN staff_member sm on sm.id = loan_file.underwriter_id
+                                         --expedited cd tag details
+                                         left join tag_map exp_cd
+                                           on exp_cd.loan_file_id = lfke.loan_file_id and exp_cd.tag_id = 250
+                                         --latest FR activity details
+                                         left join (select
+                                                      loan_file_id,
+                                                      max(created_at) as created_at
+                                                    from activity
+                                                    where name = 'CompleteFinalUnderwritingReview'
+                                                          and is_deleted = 'False'
+                                                    group by 1) fr_activity
+                                           on fr_activity.loan_file_id = lfke.loan_file_id
+                                         LEFT JOIN
+                                         (select
+                                            loan_file_id,
+                                            ast.created_at as completion_time
+                                          from activity
+                                            left join activity_status_transition ast on ast.activity_id = activity.id
+                                          where ((business_role not in
+                                                  ('UNDERWRITER', 'PREPROCESSOR', 'CLOSER', 'LOAN_OFFICER', 'CES')
+                                                  --excluded loan officer and closer because of certain activities which shouldn't block CTC
+                                                  and requires_uw_review is false and to_status = 'Finished')
+                                                 or (business_role not in
+                                                     ('UNDERWRITER', 'PREPROCESSOR', 'CLOSER', 'LOAN_OFFICER', 'CES')
+                                                     --excluded loan officer and closer because of certain activities which shouldn't block CTC
+                                                     and requires_uw_review is true and to_status = 'UnderwriterReview')
+                                                 or (business_role in ('UNDERWRITER', 'PREPROCESSOR') and
+                                                     to_status = 'Inbound'))
+                                                and is_deleted = 'False'
+                                                and activity.milestone in ('LOCK',
+                                                                           'PRELOCK',
+                                                                           'COMPLETE_DOCUMENTATION'
+                                                                           'INITIAL_UNDERWRITING',
+                                                                           'INITIAL_DOCUMENTATION',
+                                                                           'VERIFIED_LETTER',
+                                                                           'CONDITIONAL_APPROVAL'
+                                          )
+                                                and activity.title NOT LIKE '%Notes to LR/UW%'
+                                                and activity.name NOT IN ('MortgageeChangeAlert')
+                                         ) last_activity
+                                           ON last_activity.loan_file_id = lfke.loan_file_id and
+                                              last_activity.completion_time < fr_activity.created_at
+                                       group by 1, 2, 3, 4
+                                     ) master
+                                where date_trunc('month', clear_to_close_at) >=
+                                      date_trunc('month', getdate() - interval '14 months')
+                                      and staff_member_id is not null
+                                group by 1
+                                order by 1 desc),
+    suspense_review_time as ( SELECT
+                                date_trunc('month', suspense_review_by_uw) :: date   as month,
+--                                 staff_member_id,
+                                median(extract('hours' FROM suspense_review_by_uw -
+                                                            suspense_cleared_by_lr)) as susp_review_time
+                              FROM (
+                                     SELECT
+                                       suspense.loan_file_id,
+                                       suspense.completed_at         as suspense_cleared_by_lr,
+                                       sm.reports_to                 as staff_member_id,
+                                       min(ir_activity.completed_at) as suspense_review_by_uw
+                                     FROM
+                                       --getting suspense activity details
+                                       (SELECT
+                                          activity.loan_file_id,
+                                          activity.id    as activity_id,
+                                          ast.created_at as completed_at
+                                        FROM activity
+                                          LEFT JOIN activity_status_transition ast on activity.id = ast.activity_id
+                                        where name LIKE 'ResolveInitialReviewSuspensionReasons%'
+                                              and ast.to_status = 'Finished'
+                                       ) suspense
+                                       --getting uw name and uw manager name
+                                       LEFT JOIN loan_file on loan_file.id = suspense.loan_file_id
+                                       LEFT JOIN staff_member sm on sm.id = loan_file.underwriter_id
+                                       --getting IR activity details
+                                       LEFT JOIN
+                                       (SELECT
+                                          activity.loan_file_id,
+                                          activity.id    as activity_id,
+                                          ast.created_at as completed_at
+                                        FROM activity
+                                          LEFT JOIN activity_status_transition ast on activity.id = ast.activity_id
+                                        where name = 'CompleteInitialUnderwriterReviewV2'
+                                              and ast.to_status = 'Finished'
+                                       ) ir_activity
+                                         on ir_activity.loan_file_id = suspense.loan_file_id and
+                                            ir_activity.completed_at > suspense.completed_at
+                                     GROUP BY 1, 2, 3
+                                   ) t1
+                              where suspense_review_by_uw notnull
+                                    and date_trunc('month', suspense_review_by_uw) >= '2018-01-01'
+                                    and staff_member_id is not null
+                              GROUP BY 1
+                              ORDER BY 1 desc),
+    vpal_reviews as ( SELECT
+                        DATE_TRUNC('month', completed_at) :: date as month,
+--                         staff_member_id,
+                        count(distinct loan_file_id)              as num_vpals_reviewed
+                      FROM
+                        (
+                          SELECT distinct
+                            loan_file_id,
+                            ast.created_at                            as completed_at,
+                            uw.reports_to                             as staff_member_id,
+                            row_number()
+                            over (
+                              partition by loan_file_id
+                              order by loan_file_id, ast.created_at ) as rank
+                          FROM activity
+                            LEFT JOIN activity_status_transition ast on activity.id = ast.activity_id
+                            LEFT JOIN staff_member uw on uw.account_id = ast.account_id
+                          WHERE name like 'SubmitVerificationDecision%'
+                                AND ast.to_status = 'Finished' and reports_to is not null
+                          ORDER BY loan_file_id, ast.created_at
+                        ) vpal
+                      Where rank = 1
+                      GROUP BY 1
+                      ORDER BY 1 DESC)
+SELECT month.month,
+       start_stats.final_underwrites_completed,
+       start_stats.initial_reviews_completed,
+       ir_cycle_time.initial_review_cycle_time,
+       final_review_cycle_time.final_review_cycle_time,
+       suspense_review_time.susp_review_time,
+       vpal_reviews.num_vpals_reviewed
+FROM month
+  LEFT JOIN Start_stats
+    ON Start_stats.month = month.month
+  LEFT JOIN ir_cycle_time
+    ON ir_cycle_time.month = month.month
+  LEFT JOIN final_review_cycle_time
+    ON final_review_cycle_time.month = month.month
+  LEFT JOIN suspense_review_time
+    ON suspense_review_time.month = month.month
+  LEFT JOIN vpal_reviews
+    ON vpal_reviews.month = month.month
+order by 1 desc
